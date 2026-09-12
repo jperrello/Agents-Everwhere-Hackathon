@@ -9,16 +9,36 @@ from flask import Flask, jsonify, request, send_file
 from openai import OpenAI
 from zeroconf import ServiceBrowser, ServiceInfo, ServiceListener, Zeroconf
 
+
+def loadenv():
+    if not os.path.exists(".env"):
+        return
+    with open(".env") as file:
+        for line in file:
+            key, mark, value = line.strip().partition("=")
+            if key and mark and not key.startswith("#"):
+                os.environ.setdefault(key, value)
+
+
+loadenv()
 app = Flask(__name__)
 lock = threading.Lock()
 room = {"items": [], "synthesis": None, "saturn": {"status": "not checked", "service": None, "endpoint": None, "model": None}}
 
 
 def props(info):
-    return {key.decode(): value.decode(errors="replace") for key, value in info.properties.items()}
+    data = {}
+    for key, value in info.properties.items():
+        if value is None:
+            continue
+        name = key.decode(errors="replace") if isinstance(key, bytes) else str(key)
+        data[name] = value.decode(errors="replace") if isinstance(value, bytes) else str(value)
+    return data
 
 
 def url(info, data):
+    if data.get("api_base"):
+        return data["api_base"].rstrip("/")
     host = info.server.rstrip(".")
     path = data.get("path", "").strip()
     endpoint = f"{data.get('scheme', 'http')}://{host}:{info.port}"
@@ -84,10 +104,10 @@ def direct():
     endpoint = os.getenv("SATURN_DIRECT_URL", "").strip()
     if not endpoint:
         return None
-    endpoint, model = models(endpoint)
-    if not endpoint:
-        return None
-    return {"status": "direct fallback", "service": "SATURN_DIRECT_URL", "endpoint": endpoint, "model": model}
+    checked, model = models(endpoint)
+    if not endpoint.rstrip("/").endswith("/v1"):
+        endpoint = endpoint.rstrip("/") + "/v1"
+    return {"status": "direct fallback", "service": "SATURN_DIRECT_URL", "endpoint": checked or endpoint, "model": model or os.getenv("SATURN_MODEL")}
 
 
 def update_saturn():
