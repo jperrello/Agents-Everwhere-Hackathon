@@ -1,2 +1,4 @@
-.env
+saturn-room.sqlite3
 __pycache__/
+*.pyc
+.env
