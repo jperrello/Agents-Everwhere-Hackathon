@@ -1,6 +1,6 @@
 # Saturn Room
 
-Saturn Room is a local, multi-person facilitation agent for a physical room. People join the room network, contribute notes from the shared board, and leave with a concrete team handoff. Saturn discovers the shared cloud-compatible AI service on the local network when one is available.
+Saturn Room is a local, multi-person facilitation agent for a physical room. People join the room network, contribute notes from the shared board, run a focused Mission Control session, and leave with a concrete team handoff. Saturn discovers the shared cloud-compatible AI service on the local network when one is available.
 
 Saturn is pre-existing infrastructure. Saturn Room is the application built on top of it: shared state, live collaboration, diagnostic room pulses, and handoff. Saturn is not the point of the product; it is the room's model lane. The room remains useful without it, which is important for an event network demo.
 
@@ -24,13 +24,16 @@ The board is persisted in `saturn-room.sqlite3` by default. Set `ROOM_DB` to cho
 - mDNS discovery of `_saturn._tcp.local.` services, with direct cloud fallback.
 - Live shared updates through Server-Sent Events.
 - Room notes from the browser, labeled by source, with comments and threaded replies.
+- Mission Control: set a 5–120 minute room mission, watch opted-in signals form a constellation, turn grounded actions into one-vote-per-anonymous-browser-badge choices, and freeze the winner into a Launch Card.
 - A fast AI board summary refreshed whenever a note arrives, preferring a discovered Haiku model. It summarizes and diagnoses the notes without inventing opportunities or commitments.
-- A Room Pulse after every three notes: current situation, emerging decision, unresolved tension, and open question.
+- A Room Pulse refreshed as notes arrive: current situation, emerging decision, unresolved tension, and open question.
 - A “Turn into actionable items” control that generates grounded, separate tasks from the current notes.
-- Markdown/JSON handoff with decisions, volunteers, blockers, actions, and unresolved items.
+- Downloadable Markdown/JSON handoff with decisions, volunteers, blockers, actions, unresolved items, and the vote-backed Launch Card when the room creates one.
 - Generic connector ingestion endpoint for future Slack, Discord, Teams, and other adapters.
 - Optional Exa web research with source links and a Saturn-generated research brief.
 - Local brief mode so the end-to-end room workflow does not fail when mDNS or model inference is unavailable.
+
+Mission votes use a locally stored anonymous browser badge, not an account or identity service. That keeps the zero-setup room flow intact and prevents another display name from replacing a browser's vote; use moderator/auth controls before treating a room vote as a security boundary.
 
 ## The judging story
 
@@ -38,10 +41,10 @@ The demo is not “we found a model.” It is “a temporary room can create a s
 
 Suggested three-minute run:
 
-1. Open the board on two devices and add an idea, question, and blocker as different people.
-2. Show the live board and Room Pulse appearing without a page refresh.
-3. Turn the pulse into actionable items, then create and download the handoff.
-4. Retry Saturn discovery or stop the model lane. Explain that the room stays operational in local brief mode rather than losing the group's work.
+1. Open the board on two devices, start a 10-minute mission, then add an idea, question, and blocker as different people.
+2. Show the live board, signal constellation, and Room Pulse appearing without a page refresh.
+3. Turn the pulse into action choices, have each connected browser vote, then create the Launch Card and download the handoff.
+4. Retry Saturn discovery or stop the model lane. Explain that the room stays operational in local brief mode rather than losing the group's work or vote.
 
 ## Web research
 

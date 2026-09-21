@@ -28,7 +28,7 @@ def loadenv():
 loadenv()
 app = Flask(__name__)
 dbpath = os.getenv("ROOM_DB", "saturn-room.sqlite3")
-lock = threading.Lock()
+lock = threading.RLock()
 listeners = []
 webzc = None
 room = {
@@ -38,6 +38,9 @@ room = {
     "pulse": None,
     "handoff": None,
     "research": None,
+    "mission": None,
+    "votes": [],
+    "launch": None,
     "saturn": {"status": "checking", "service": None, "endpoint": None, "model": None, "models": [], "detail": "Looking for a Saturn model service on this network."},
 }
 saturn_key = None
@@ -59,6 +62,16 @@ def initdb():
             conn.execute("ALTER TABLE items ADD COLUMN parent_id TEXT")
         conn.execute("CREATE TABLE IF NOT EXISTS summaries (id INTEGER PRIMARY KEY CHECK (id = 1), text TEXT NOT NULL, created_at TEXT NOT NULL)")
         conn.execute("CREATE TABLE IF NOT EXISTS pulses (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL)")
+        conn.execute("CREATE TABLE IF NOT EXISTS missions (id TEXT PRIMARY KEY, title TEXT NOT NULL, owner TEXT NOT NULL, duration INTEGER NOT NULL, started_at TEXT NOT NULL, status TEXT NOT NULL)")
+        conn.execute("CREATE TABLE IF NOT EXISTS votes (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, participant TEXT NOT NULL, name TEXT NOT NULL, action TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(mission_id, participant))")
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(votes)")}
+        if "participant" not in columns:
+            conn.execute("ALTER TABLE votes RENAME TO old_votes")
+            conn.execute("CREATE TABLE votes (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, participant TEXT NOT NULL, name TEXT NOT NULL, action TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(mission_id, participant))")
+            conn.execute("INSERT INTO votes (id, mission_id, participant, name, action, created_at) SELECT id, mission_id, name, name, action, created_at FROM old_votes")
+            conn.execute("DROP TABLE old_votes")
+        conn.execute("CREATE TABLE IF NOT EXISTS launches (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL UNIQUE, data TEXT NOT NULL, created_at TEXT NOT NULL)")
+        conn.execute("CREATE TABLE IF NOT EXISTS syntheses (mission_id TEXT PRIMARY KEY, data TEXT NOT NULL, created_at TEXT NOT NULL)")
 
 
 def loadroom():
@@ -66,6 +79,7 @@ def loadroom():
         rows = conn.execute("SELECT id, name, kind, text, source, external_id, created_at, parent_id FROM items ORDER BY created_at, rowid").fetchall()
         saved = conn.execute("SELECT text, created_at FROM summaries WHERE id = 1").fetchone()
         saved_pulse = conn.execute("SELECT data FROM pulses WHERE id = 1").fetchone()
+        saved_mission = conn.execute("SELECT id, title, owner, duration, started_at, status FROM missions ORDER BY started_at DESC LIMIT 1").fetchone()
     room["items"] = [{"id": row[0], "name": row[1], "kind": row[2], "text": row[3], "source": row[4], "external_id": row[5], "created_at": row[6], "parent_id": row[7]} for row in rows]
     if saved:
         room["summary"] = {"text": saved[0], "created_at": saved[1]}
@@ -74,6 +88,24 @@ def loadroom():
             room["pulse"] = json.loads(saved_pulse[0])
         except json.JSONDecodeError:
             room["pulse"] = None
+    if not saved_mission:
+        return
+    room["mission"] = {"id": saved_mission[0], "title": saved_mission[1], "owner": saved_mission[2], "duration": saved_mission[3], "started_at": saved_mission[4], "status": saved_mission[5]}
+    with database() as conn:
+        saved_votes = conn.execute("SELECT id, mission_id, participant, name, action, created_at FROM votes WHERE mission_id = ? ORDER BY created_at", (saved_mission[0],)).fetchall()
+        saved_launch = conn.execute("SELECT data FROM launches WHERE mission_id = ?", (saved_mission[0],)).fetchone()
+        saved_synthesis = conn.execute("SELECT data FROM syntheses WHERE mission_id = ?", (saved_mission[0],)).fetchone()
+    room["votes"] = [{"id": row[0], "mission_id": row[1], "participant": row[2], "name": row[3], "action": row[4], "created_at": row[5]} for row in saved_votes]
+    if saved_launch:
+        try:
+            room["launch"] = json.loads(saved_launch[0])
+        except json.JSONDecodeError:
+            room["launch"] = None
+    if saved_synthesis:
+        try:
+            room["synthesis"] = json.loads(saved_synthesis[0])
+        except json.JSONDecodeError:
+            room["synthesis"] = None
 
 
 def address():
@@ -121,7 +153,10 @@ def announce(port):
 
 def state():
     with lock:
-        return json.loads(json.dumps(room))
+        value = json.loads(json.dumps(room))
+    for vote in value["votes"]:
+        vote.pop("participant", None)
+    return value
 
 
 def emit(kind, data):
@@ -419,10 +454,41 @@ def pulse():
         emit("pulse", result)
 
 
+def choices(brief):
+    if not isinstance(brief, dict):
+        return []
+    return [str(value).strip() for value in brief.get("actions", []) if str(value).strip()]
+
+
+def expired(value):
+    try:
+        return datetime.fromisoformat(value["started_at"]).timestamp() + int(value["duration"]) * 60 <= time.time()
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def current():
+    with lock:
+        value = dict(room["mission"]) if room["mission"] else None
+    if not value or value.get("status") != "active" or not expired(value):
+        return value
+    with lock:
+        value = dict(room["mission"]) if room["mission"] else None
+        if not value or value.get("status") != "active" or not expired(value):
+            return value
+        with database() as conn:
+            conn.execute("UPDATE missions SET status = 'expired' WHERE id = ? AND status = 'active'", (value["id"],))
+        room["mission"] = {**value, "status": "expired"}
+        result = dict(room["mission"])
+    emit("mission", result)
+    return result
+
+
 def synthesis():
     with lock:
         if not room["items"]:
             raise ValueError("Add at least one room item before synthesizing.")
+        mission_id = room["mission"]["id"] if room["mission"] else None
     try:
         brief = ask("Return only valid JSON with string-array keys decisions, risks, questions, actions, volunteers, blockers, unresolved_items and string key pitch. Summarize the current notes. Treat distinct subjects as distinct workstreams: if the notes discuss two unrelated topics, preserve two separate actionable items rather than merging them into one generic action. Split actions into concrete, separate tasks only when the notes support them; do not invent owners, deadlines, or work that is not grounded in the notes.\n\nRoom notes:\n" + notes()) if state()["saturn"].get("endpoint") else local_synthesis()
     except Exception:
@@ -430,9 +496,23 @@ def synthesis():
             room["saturn"]["detail"] = "Saturn inference failed; using the room's local brief mode."
         emit("saturn", state()["saturn"])
         brief = local_synthesis()
+    changed = False
     with lock:
+        active = dict(room["mission"]) if room["mission"] else None
+        if mission_id != (active or {}).get("id"):
+            return brief
+        changed = bool(active and active.get("status") == "active" and room["votes"]) and choices(room["synthesis"] or {}) != choices(brief)
         room["synthesis"] = brief
+        if changed:
+            room["votes"] = []
+        if active:
+            with database() as conn:
+                conn.execute("INSERT INTO syntheses (mission_id, data, created_at) VALUES (?, ?, ?) ON CONFLICT(mission_id) DO UPDATE SET data = excluded.data, created_at = excluded.created_at", (active["id"], json.dumps(brief), now()))
+                if changed:
+                    conn.execute("DELETE FROM votes WHERE mission_id = ?", (active["id"],))
     emit("synthesis", brief)
+    if changed:
+        emit("vote", [])
     return brief
 
 
@@ -449,6 +529,79 @@ def add(text, kind, name, source="board", external_id=None, parent_id=None):
     return item
 
 
+def tally(actions):
+    with lock:
+        votes = list(room["votes"])
+    result = []
+    for action in actions:
+        result.append({"action": action, "votes": sum(vote["action"] == action for vote in votes)})
+    return result
+
+
+def mission(title, owner, duration):
+    value = {"id": str(uuid4()), "title": title, "owner": owner, "duration": duration, "started_at": now(), "status": "active"}
+    with lock:
+        with database() as conn:
+            conn.execute("UPDATE missions SET status = 'closed' WHERE status = 'active'")
+            conn.execute("INSERT INTO missions (id, title, owner, duration, started_at, status) VALUES (?, ?, ?, ?, ?, ?)", tuple(value.values()))
+        room["mission"] = value
+        room["synthesis"] = None
+        room["votes"] = []
+        room["launch"] = None
+    emit("mission", value)
+    return value
+
+
+def cast(action, name, participant):
+    with lock:
+        active = current()
+        if not active or active.get("status") != "active":
+            raise ValueError("Start an active mission before voting.")
+        actions = choices(room["synthesis"] or {})
+        if action not in actions:
+            raise ValueError("Choose one of the room's current actionable items.")
+        value = {"id": str(uuid4()), "mission_id": active["id"], "participant": participant, "name": name, "action": action, "created_at": now()}
+        with database() as conn:
+            conn.execute("INSERT INTO votes (id, mission_id, participant, name, action, created_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(mission_id, participant) DO UPDATE SET name = excluded.name, action = excluded.action, created_at = excluded.created_at", tuple(value.values()))
+            row = conn.execute("SELECT id, mission_id, participant, name, action, created_at FROM votes WHERE mission_id = ? AND participant = ?", (active["id"], participant)).fetchone()
+        value = {"id": row[0], "mission_id": row[1], "participant": row[2], "name": row[3], "action": row[4], "created_at": row[5]}
+        room["votes"] = [vote for vote in room["votes"] if vote["participant"] != participant]
+        room["votes"].append(value)
+        result = tally(actions)
+    emit("vote", result)
+    return result
+
+
+def launch():
+    with lock:
+        active = current()
+        if not active or active.get("status") != "active":
+            raise ValueError("Start an active mission before creating a Launch Card.")
+        brief = room["synthesis"]
+        if not brief:
+            raise ValueError("Prepare the room's action choices before creating a Launch Card.")
+        actions = choices(brief)
+        votes = tally(actions)
+        if not any(value["votes"] for value in votes):
+            raise ValueError("Collect at least one current room vote before creating a Launch Card.")
+        ranked = sorted(votes, key=lambda value: (-value["votes"], actions.index(value["action"])))
+        nexts = ranked[:3]
+        primary = nexts[0]["action"] if nexts else "No action was proposed from the room notes."
+        decision = next((str(value).strip() for value in brief.get("decisions", []) if str(value).strip()), primary)
+        risk = next((str(value).strip() for value in brief.get("unresolved_items", []) + brief.get("blockers", []) + brief.get("questions", []) if str(value).strip()), "No unresolved risk was recorded.")
+        launched = {**active, "status": "launched"}
+        value = {"id": str(uuid4()), "mission": launched, "decision": decision, "primary_action": primary, "actions": nexts, "owner": active["owner"], "risk": risk, "votes": votes, "created_at": now()}
+        with database() as conn:
+            changed = conn.execute("UPDATE missions SET status = 'launched' WHERE id = ? AND status = 'active'", (active["id"],))
+            if changed.rowcount != 1:
+                raise ValueError("The mission changed before its Launch Card could be created.")
+            conn.execute("INSERT INTO launches (id, mission_id, data, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(mission_id) DO UPDATE SET data = excluded.data, created_at = excluded.created_at", (value["id"], active["id"], json.dumps(value), value["created_at"]))
+        room["mission"] = launched
+        room["launch"] = value
+    emit("launch", value)
+    return value
+
+
 initdb()
 loadroom()
 
@@ -463,10 +616,20 @@ def check_connector():
 
 def handoff():
     brief = synthesis()
-    payload = {"generated_at": now(), "items": state()["items"], **brief}
+    current = state()
+    payload = {"generated_at": now(), "items": current["items"], **brief}
+    if current.get("launch"):
+        payload["launch"] = current["launch"]
     markdown = "# Saturn Room handoff\n\n"
     markdown += f"Generated: {payload['generated_at']}\n\n"
     markdown += f"## Summary\n\n{payload.get('pitch', '')}\n\n"
+    if payload.get("launch"):
+        card = payload["launch"]
+        markdown += "## Launch Card\n\n"
+        markdown += f"Mission: {card['mission']['title']}\n\n"
+        markdown += f"Decision: {card['decision']}\n\n"
+        markdown += f"Mission lead: {card['owner'] or 'Not assigned'}\n\n"
+        markdown += f"Unresolved risk: {card['risk']}\n\n"
     for title, key in [("Decisions", "decisions"), ("Volunteers", "volunteers"), ("Blockers", "blockers"), ("Next actions", "actions"), ("Unresolved items", "unresolved_items")]:
         markdown += f"## {title}\n\n"
         markdown += "\n".join(f"- {value}" for value in payload.get(key, [])) or "- None recorded"
@@ -504,6 +667,7 @@ def captive():
 
 @app.get("/api/room")
 def getroom():
+    current()
     return jsonify(state())
 
 
@@ -544,6 +708,50 @@ def additem():
             if not any(item["id"] == parent_id for item in room["items"]):
                 return jsonify({"error": "The message being replied to was not found."}), 404
     return jsonify(add(text, kind, name or "Guest", "board", parent_id=parent_id)), 201
+
+
+@app.post("/api/mission")
+def setmission():
+    data = request.get_json(silent=True) or {}
+    title = str(data.get("title", "")).strip()
+    owner = str(data.get("owner", "")).strip()
+    try:
+        duration = int(data.get("duration", 15))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Mission duration must be a whole number of minutes."}), 400
+    if not title or len(title) > 120:
+        return jsonify({"error": "A mission title up to 120 characters is required."}), 400
+    if len(owner) > 40:
+        return jsonify({"error": "Mission lead must be 40 characters or fewer."}), 400
+    if duration < 5 or duration > 120:
+        return jsonify({"error": "Choose a mission duration between 5 and 120 minutes."}), 400
+    return jsonify(mission(title, owner, duration)), 201
+
+
+@app.post("/api/votes")
+def castvote():
+    data = request.get_json(silent=True) or {}
+    action = str(data.get("action", "")).strip()
+    name = str(data.get("name", "")).strip()
+    participant = str(data.get("participant", "")).strip()
+    if not name or len(name) > 40:
+        return jsonify({"error": "Your name is required to vote."}), 400
+    if not participant or len(participant) > 80:
+        return jsonify({"error": "Your anonymous room badge is required to vote."}), 400
+    try:
+        return jsonify({"votes": cast(action, name, participant)})
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
+
+
+@app.post("/api/launch")
+def createlaunch():
+    try:
+        return jsonify({"launch": launch()})
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
+    except (RuntimeError, json.JSONDecodeError, OSError) as error:
+        return jsonify({"error": str(error)}), 503
 
 
 @app.post("/api/synthesize")
